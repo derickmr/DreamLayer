@@ -11,7 +11,6 @@ import json
 import subprocess
 from dream_layer_backend_utils.random_prompt_generator import fetch_positive_prompt, fetch_negative_prompt
 from dream_layer_backend_utils.fetch_advanced_models import get_lora_models, get_settings, is_valid_directory, get_upscaler_models, get_controlnet_models
-from dream_layer_backend_utils.random_prompt_generator import fetch_positive_prompt, fetch_negative_prompt
 # Add ComfyUI directory to Python path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -83,6 +82,10 @@ if os.environ.get('DREAMLAYER_COMFYUI_CPU_MODE', 'false').lower() == 'true':
     print("Forcing ComfyUI to run in CPU mode as requested.")
     sys.argv.append('--cpu')
 
+# Allow WebSocket connections from frontend
+cors_origin = os.environ.get('COMFYUI_CORS_ORIGIN', 'http://localhost:8080')
+sys.argv.extend(['--enable-cors-header', cors_origin])
+
 # Only add ComfyUI to path if it exists and we need to start the server
 def import_comfyui_main():
     """Import ComfyUI main module only when needed"""
@@ -123,6 +126,7 @@ def get_available_models():
     """
     Fetch available checkpoint models from ComfyUI and append closed-source models
     """
+    from shared_utils import get_model_display_name
     formatted_models = []
     
     # Get ComfyUI models
@@ -130,10 +134,9 @@ def get_available_models():
         response = requests.get(f"{COMFY_API_URL}/models/checkpoints")
         if response.status_code == 200:
             models = response.json()
-            # Convert filenames to more user-friendly names
+            # Convert filenames to more user-friendly names (using display name mapping when available)
             for filename in models:
-                name = filename.split('.')[0].replace('-', ' ').replace('_', ' ')
-                name = ' '.join(word.capitalize() for word in name.split())
+                name = get_model_display_name(filename)
                 formatted_models.append({
                     "id": filename,
                     "name": name,
@@ -277,15 +280,15 @@ def get_available_lora_models():
     """
     Fetch available LoRA models from ComfyUI
     """
+    from shared_utils import get_model_display_name
     formatted_models = []
     
     try:
         models = get_lora_models()
         
-        # Convert filenames to more user-friendly names
+        # Convert filenames to more user-friendly names (using display name mapping when available)
         for filename in models:
-            name = filename.split('.')[0].replace('-', ' ').replace('_', ' ')
-            name = ' '.join(word.capitalize() for word in name.split())
+            name = get_model_display_name(filename)
             formatted_models.append({
                 "id": filename,
                 "name": name,
@@ -295,6 +298,12 @@ def get_available_lora_models():
         print(f"Error fetching LoRA models: {str(e)}")
     
     return formatted_models
+
+@app.route('/', methods=['GET'])
+def is_server_running():
+    return jsonify({
+        "status": "success"
+        })
 
 @app.route('/api/lora-models', methods=['GET'])
 def handle_get_lora_models():
@@ -312,6 +321,45 @@ def handle_get_lora_models():
             "status": "error",
             "message": str(e)
         }), 500
+        
+@app.route('/api/add-api-key', methods=['POST'])
+def add_api_key():
+    """
+    Update or add an API key in the .env file.
+    Expects JSON: { "alias": "OPENAI_API_KEY", "api-key": "sk-..." }
+    """
+    try:
+        data = request.get_json()
+        alias = data.get('alias')
+        api_key = data.get('api-key')
+
+        if not alias or not api_key:
+            return jsonify({"status": "error", "message": "Missing alias or api_key"}), 400
+
+        env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
+        lines = []
+        found = False
+        
+        if os.path.exists(env_path):
+            with open(env_path, 'r') as f:
+                lines = f.readlines()
+
+        new_lines = []
+        for line in lines:
+            if line.strip().startswith(f"{alias}="):
+                new_lines.append(f"{alias}={api_key}\n")
+                found = True
+            else:
+                new_lines.append(line)
+        if not found:
+            new_lines.append(f"\n{alias}={api_key}")
+
+        with open(env_path, 'w') as f:
+            f.writelines(new_lines)
+
+        return jsonify({"status": "success", "message": f"{alias} updated in .env"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/api/fetch-prompt', methods=['GET'])
 def fetch_prompt():
@@ -444,6 +492,42 @@ def upload_controlnet_image():
             
     except Exception as e:
         print(f"❌ Error uploading ControlNet image: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+@app.route('/api/upload-model', methods=['POST'])
+def upload_model():
+    """
+    Endpoint to upload model files to ComfyUI models directory
+    Supports formats: .safetensors, .ckpt, .pth, .pt, .bin
+    Supports types: checkpoints, loras, controlnet, upscale_models, vae, embeddings, hypernetworks
+    """
+    try:
+        from shared_utils import upload_model_file
+
+        if 'file' not in request.files:
+            return jsonify({
+                "status": "error",
+                "message": "No file provided in request"
+            }), 400
+
+        file = request.files['file']
+        model_type = request.form.get('model_type', 'checkpoints')
+
+        result = upload_model_file(file, model_type)
+
+        if not isinstance(result, tuple):
+            return jsonify(result)
+
+        response_data, status_code = result
+        return jsonify(response_data), status_code
+
+    except Exception as e:
+        print(f"❌ Error in model upload endpoint: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({
